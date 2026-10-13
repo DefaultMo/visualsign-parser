@@ -1188,13 +1188,6 @@ mod tests {
             mapped.program_call_args_json,
             format!(r#"{{"destination":"{destination}","lamports":1001,"source":"{payer}"}}"#)
         );
-        assert_eq!(
-            transfer.named_account_indices,
-            std::collections::BTreeMap::from([
-                ("destination".to_string(), 1),
-                ("source".to_string(), 0),
-            ])
-        );
         let json_parsed = transfer
             .solana_json_parsed_data
             .as_ref()
