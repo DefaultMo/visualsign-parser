@@ -49,8 +49,8 @@ pub(super) fn is_decodable(program_id: &str) -> bool {
     program_id == COMPUTE_BUDGET_PROGRAM || SOLANA_JSON_PARSED_PROGRAMS.contains(&program_id)
 }
 
-/// Name the HSM-facing output uses for SPL Memo, which `jsonParsed` decodes
-/// to a bare string with no instruction type.
+/// Name `parsed_instruction_data` uses for SPL Memo, which `jsonParsed`
+/// decodes to a bare string with no instruction type.
 const MEMO_INSTRUCTION_NAME: &str = "memo";
 
 /// A `jsonParsed`-shaped decode of one instruction: the decoder's program
@@ -117,7 +117,7 @@ fn decode_compute_budget(data: &[u8]) -> Result<Value, String> {
 
 /// Maps a `jsonParsed` decode to `parsed_instruction_data`. With `raw_data`
 /// (outer, partially-decoded inner) the discriminator must prefix it.
-/// `info` stays whole in the args: the HSM reads accounts from there.
+/// `info` stays whole in the args: consumers read accounts from there.
 pub(super) fn from_json_parsed(
     program_id: &str,
     parsed: &Value,
@@ -173,7 +173,7 @@ pub(super) fn from_json_parsed(
 }
 
 /// `uiAmount` is an `f64` the decoder derives from `amount` and `decimals`.
-/// Floats have no canonical JSON form, so the policy bytes keep the exact fields only.
+/// Floats have no canonical JSON form, so the args keep the exact fields only.
 fn drop_float_ui_amounts(map: &mut serde_json::Map<String, Value>) {
     if matches!(map.get("uiAmount"), Some(Value::Number(_) | Value::Null)) {
         map.remove("uiAmount");
@@ -1356,7 +1356,7 @@ mod tests {
     }
 
     #[test]
-    fn discriminators_match_the_consumer_keys() {
+    fn discriminators_match_their_program_encodings() {
         let cases: &[(&str, &str, &str)] = &[
             (TOKEN_PROGRAM, "transfer", "03"),
             (TOKEN_PROGRAM, "mintTo", "07"),

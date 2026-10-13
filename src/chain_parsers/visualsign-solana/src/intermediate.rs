@@ -57,7 +57,7 @@ use native_instruction_data::NativeDecode;
 const ADDRESS_TABLE_LOOKUP: &str = "ADDRESS_TABLE_LOOKUP";
 
 /// Why a `Native` instruction's program cannot be decoded at all. Shared by
-/// the outer and inner paths so the HSM sees one marker for it.
+/// the outer and inner paths so consumers see one marker for it.
 const UNSUPPORTED_NATIVE_PROGRAM: &str = "program has no native decoder";
 
 /// Version of the `SolanaIntermediateOutput` Borsh schema. Bump on ANY change
@@ -1996,7 +1996,7 @@ mod tests {
             "not native, so nothing to explain"
         );
 
-        // The HSM maps names to account positions by key, so every named
+        // Consumers map names to account positions by key, so every named
         // account must be an `accounts` entry (lookup-table ones are masked).
         for instruction in &output.instructions {
             let Some(parsed) = &instruction.parsed_instruction_data else {
