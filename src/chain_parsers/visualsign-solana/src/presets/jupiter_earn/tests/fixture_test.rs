@@ -349,10 +349,7 @@ fn test_unverifiable_recipient_is_badged() {
         panic!("expected preview_layout");
     };
 
-    assert_eq!(
-        title_of(&preview_layout),
-        "Supply USDC to Jupiter Lend"
-    );
+    assert_eq!(title_of(&preview_layout), "Supply USDC to Jupiter Lend");
     let condensed = preview_layout.condensed.as_ref().expect("condensed view");
     let recipient = condensed
         .fields
@@ -540,10 +537,7 @@ fn test_withdraw_with_max_shares_burn() {
         &[10_000_000, 9_800_000],
         &[],
     ));
-    assert_eq!(
-        title_of(&layout),
-        "Redeem jlUSDC for USDC via Jupiter Lend"
-    );
+    assert_eq!(title_of(&layout), "Redeem jlUSDC for USDC via Jupiter Lend");
     assert!(
         condensed_value(&layout, "Burn")
             .unwrap()
@@ -658,10 +652,7 @@ fn test_u64_max_outside_withdraw_renders_the_flagged_literal() {
     const LITERAL: &str = "18446744073709551615 raw units of jlUSDC (u64::MAX)";
 
     let layout = visualize(&synthetic_instruction("redeem", &[u64::MAX], &[]));
-    assert_eq!(
-        title_of(&layout),
-        "Redeem jlUSDC via Jupiter Lend"
-    );
+    assert_eq!(title_of(&layout), "Redeem jlUSDC via Jupiter Lend");
     assert_eq!(condensed_value(&layout, "Amount").unwrap(), LITERAL);
 
     let layout = visualize(&synthetic_instruction("mint", &[u64::MAX], &[]));
@@ -669,10 +660,7 @@ fn test_u64_max_outside_withdraw_renders_the_flagged_literal() {
     assert_eq!(condensed_value(&layout, "Amount").unwrap(), LITERAL);
 
     let layout = visualize(&synthetic_instruction("deposit", &[u64::MAX], &[]));
-    assert_eq!(
-        title_of(&layout),
-        "Supply USDC to Jupiter Lend"
-    );
+    assert_eq!(title_of(&layout), "Supply USDC to Jupiter Lend");
 }
 
 /// The full-exit sentinel is verified for plain `withdraw` only. The capped
@@ -686,10 +674,7 @@ fn test_capped_withdraw_with_u64_max_renders_the_flagged_literal() {
         &[],
     ));
     const LITERAL: &str = "18446744073709551615 raw units of USDC (u64::MAX)";
-    assert_eq!(
-        title_of(&layout),
-        "Redeem jlUSDC for USDC via Jupiter Lend"
-    );
+    assert_eq!(title_of(&layout), "Redeem jlUSDC for USDC via Jupiter Lend");
     assert_eq!(condensed_value(&layout, "Amount").unwrap(), LITERAL);
     assert!(
         condensed_value(&layout, "Burn")

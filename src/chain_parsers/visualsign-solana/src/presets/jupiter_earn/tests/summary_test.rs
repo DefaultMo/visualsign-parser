@@ -161,10 +161,7 @@ fn test_single_withdraw_gets_title_subtitle_and_rows() {
 
     let payload = payload_for(&[withdraw], &payer);
 
-    assert_eq!(
-        payload.title,
-        "Redeem JUICED for JupUSD via Jupiter Lend"
-    );
+    assert_eq!(payload.title, "Redeem JUICED for JupUSD via Jupiter Lend");
     assert_eq!(payload.subtitle.as_deref(), Some(JUPITER_EARN_DISPLAY_NAME));
     assert_eq!(
         top_level_value(&payload, "From").unwrap(),
@@ -291,9 +288,7 @@ fn test_forged_token_program_keeps_default_title() {
     assert_no_summary(&payload, "Solana Transaction");
     let titles = preview_titles(&payload);
     assert!(
-        titles
-            .iter()
-            .any(|t| t == "Supply USDC to Jupiter Lend"),
+        titles.iter().any(|t| t == "Supply USDC to Jupiter Lend"),
         "instruction keeps its semantic view, got {titles:?}"
     );
 }
@@ -420,10 +415,7 @@ fn test_relayed_deposit_keeps_default_title() {
 
     assert_no_summary(&payload, "Solana Transaction");
     // The per-instruction view still renders the action.
-    assert_eq!(
-        preview_titles(&payload)[0],
-        "Supply USDC to Jupiter Lend"
-    );
+    assert_eq!(preview_titles(&payload)[0], "Supply USDC to Jupiter Lend");
 }
 
 /// A caller-supplied `transaction_name` always wins over the summary.
@@ -543,9 +535,7 @@ fn test_v0_deposit_with_unverifiable_recipient_keeps_default_title() {
     assert_no_summary(&payload, "Solana V0 Transaction");
     let titles = preview_titles(&payload);
     assert!(
-        titles
-            .iter()
-            .any(|t| t == "Supply USDC to Jupiter Lend"),
+        titles.iter().any(|t| t == "Supply USDC to Jupiter Lend"),
         "instruction keeps its semantic view, got {titles:?}"
     );
 }
@@ -587,11 +577,7 @@ fn test_each_user_action_family_proposes_a_summary() {
             vec![10_000_000, 9_800_000],
             "Redeem jlUSDC for USDC via Jupiter Lend",
         ),
-        (
-            "redeem",
-            vec![1_500_000],
-            "Redeem jlUSDC via Jupiter Lend",
-        ),
+        ("redeem", vec![1_500_000], "Redeem jlUSDC via Jupiter Lend"),
         (
             "redeem_with_min_amount_out",
             vec![1_500_000, 1_490_000],
@@ -655,8 +641,5 @@ fn test_intermediate_output_matches_human_view() {
         parsed.named_accounts.get("mint").map(String::as_str),
         Some("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")
     );
-    assert_eq!(
-        result.payload.title,
-        "Supply USDC to Jupiter Lend"
-    );
+    assert_eq!(result.payload.title, "Supply USDC to Jupiter Lend");
 }
