@@ -936,14 +936,12 @@ fn builtin_idl_records() -> &'static BTreeMap<String, solana_parser::solana::str
     })
 }
 
-/// Anchor's `emit_cpi!` self-invokes with `sentinel ++ event discriminator ++ borsh(event)`.
-/// The sentinel is `sha256("anchor:event")[..8]` as a little-endian u64, the same for every program.
+/// Prefix of every Anchor `emit_cpi!` self-call: `sha256("anchor:event")[..8]` as a
+/// little-endian u64. `event discriminator ++ borsh(event)` follows it.
 const ANCHOR_EVENT_CPI_SENTINEL: [u8; 8] = [0xe4, 0x45, 0xa5, 0x2e, 0x51, 0xcb, 0x9a, 0x1d];
 
-/// `instruction_name` reported when an event CPI carries the sentinel but its payload fails to decode.
-const ANCHOR_EVENT_CPI_NAME: &str = "<anchor event cpi>";
-
-/// `solana_parser::Idl` drops the IDL's `events` array, so it is re-read from the raw JSON.
+/// `solana_parser::Idl` drops `events`, so they are re-read from the raw IDL JSON.
+/// TODO: add `events` to `solana_parser::Idl` upstream and drop this re-parse.
 #[derive(serde::Deserialize)]
 struct IdlEvent {
     name: String,
@@ -951,21 +949,23 @@ struct IdlEvent {
     discriminator: Vec<u8>,
 }
 
-#[derive(serde::Deserialize, Default)]
+#[derive(serde::Deserialize)]
 struct IdlEvents {
     #[serde(default)]
     events: Vec<IdlEvent>,
 }
 
 /// Decodes the `event discriminator ++ borsh(event)` payload that follows the sentinel.
-/// The event is matched in the IDL's `events`; its fields come from the same-named struct in `types`.
+/// Matched by discriminator in `events`; fields come from the same-named `types` struct.
 fn parse_anchor_event_cpi(
     event_data: &[u8],
     idl: &Idl,
     idl_json: &str,
     idl_source: &IdlSource,
 ) -> Result<SolanaParsedInstructionDataIo, SolanaIdlParseError> {
-    let events: IdlEvents = serde_json::from_str(idl_json).unwrap_or_default();
+    let events: IdlEvents = serde_json::from_str(idl_json).map_err(|e| {
+        SolanaIdlParseError::IdlResolutionError(format!("IDL events are malformed: {e}"))
+    })?;
     let event = event_data
         .get(..8)
         .and_then(|discriminator| {
@@ -989,10 +989,10 @@ fn parse_anchor_event_cpi(
             _ => None,
         })
         .ok_or_else(|| SolanaIdlParseError::DataParseError {
-            instruction_name: ANCHOR_EVENT_CPI_NAME.to_string(),
-            error: format!("event {} has no struct type in IDL", event.name),
+            instruction_name: event.name.clone(),
+            error: "event has no struct type in IDL".to_string(),
         })?;
-    // Shaped as an instruction so the borsh args decoder is reused; events carry no accounts.
+    // Shaped as an instruction to reuse the borsh args decoder; events have no accounts.
     let instruction = IdlInstruction {
         name: event.name,
         discriminator: Some(event.discriminator.clone()),
@@ -1001,7 +1001,7 @@ fn parse_anchor_event_cpi(
     };
     let args = parse_data_into_args(event_data, &instruction, idl).map_err(|e| {
         SolanaIdlParseError::DataParseError {
-            instruction_name: ANCHOR_EVENT_CPI_NAME.to_string(),
+            instruction_name: instruction.name.clone(),
             error: e.to_string(),
         }
     })?;
@@ -1021,8 +1021,6 @@ fn parse_anchor_event_cpi(
 /// `custom_idls.get(program_key)`. Returns `(None, None)` when `program_id` has
 /// no `IdlRecord` at all -- nothing was available to attempt against, distinct
 /// from an attempt that ran and failed (`(None, Some(err))`).
-/// An Anchor event CPI, which no `instructions` entry can match, is decoded
-/// against the IDL's `events` instead and reported under the event's name.
 fn parse_partially_decoded_instruction_idl(
     program_id: &str,
     data_base58: &str,
@@ -1058,6 +1056,7 @@ fn parse_partially_decoded_instruction_idl(
     let instruction = match find_instruction_by_discriminator(&data, idl.instructions.clone()) {
         Ok(v) => v,
         Err(e) => {
+            // Anchor event CPIs match no `instructions` entry; decode against `events`.
             let Some(event_data) = data.strip_prefix(ANCHOR_EVENT_CPI_SENTINEL.as_slice()) else {
                 return (
                     None,
@@ -1271,7 +1270,7 @@ mod tests {
     use super::*;
     use base64::Engine;
     use serde_json::json;
-    use solana_parser::solana::structs::ProgramType;
+    use solana_parser::solana::structs::{IdlRecord, ProgramType};
     use solana_sdk::message::{MessageHeader, v0};
     use std::collections::HashMap;
 
@@ -1644,7 +1643,40 @@ mod tests {
         assert!(matches!(
             error,
             Some(SolanaIdlParseError::DataParseError { instruction_name, .. })
-                if instruction_name == "<anchor event cpi>"
+                if instruction_name == "SwapsEvent"
+        ));
+    }
+
+    #[test]
+    fn anchor_event_cpi_with_malformed_idl_events_reports_idl_resolution_error() {
+        let program_id = Pubkey::new_unique().to_string();
+        // `Idl` ignores `events`, so resolution succeeds and only the event path sees it.
+        let idl_json = r#"{"instructions":[],"types":[],"events":"not-a-list"}"#;
+        let record = IdlRecord {
+            program_id: program_id.clone(),
+            program_name: "malformed".to_string(),
+            program_type: None,
+            custom_idl: Some(serde_json::from_str(idl_json).unwrap()),
+            custom_idl_json: Some(idl_json.to_string()),
+            override_builtin: true,
+            is_preset: false,
+        };
+        let caller_records = BTreeMap::from([(program_id.clone(), record)]);
+        let mut data = ANCHOR_EVENT_CPI_SENTINEL.to_vec();
+        data.extend_from_slice(&SWAPS_EVENT_DISCRIMINATOR);
+
+        let (parsed, error) = parse_partially_decoded_instruction_idl(
+            &program_id,
+            &bs58::encode(&data).into_string(),
+            &[],
+            &caller_records,
+        );
+
+        assert!(parsed.is_none());
+        assert!(matches!(
+            error,
+            Some(SolanaIdlParseError::IdlResolutionError(msg))
+                if msg.contains("IDL events are malformed")
         ));
     }
 
