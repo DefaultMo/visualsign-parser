@@ -33,8 +33,8 @@ use solana_parser::solana::idl_parser::{
     find_instruction_by_discriminator, parse_data_into_args, resolve_idl_for_record,
 };
 use solana_parser::solana::structs::{
-    self as parser, AccountAddress, IdlParseError, IdlSource, SolanaMetadata,
-    SolanaParsedInstructionData,
+    self as parser, AccountAddress, Idl, IdlField, IdlInstruction, IdlParseError, IdlSource,
+    IdlTypeDefinitionType, SolanaMetadata, SolanaParsedInstructionData,
 };
 use solana_parser::{CustomIdlConfig, parse_transaction_with_idl_records};
 use solana_sdk::instruction::CompiledInstruction;
@@ -274,9 +274,9 @@ pub enum SolanaIdlParseError {
         instruction_name: String,
         error: String,
     },
-    /// No instruction in the IDL matched the discriminator bytes -- the
-    /// program is known, but this specific call isn't one of its documented
-    /// instructions (e.g. an Anchor event-log self-CPI).
+    /// No instruction (or, for an Anchor event CPI, no event) in the IDL
+    /// matched the discriminator bytes -- the program is known, but this
+    /// specific call isn't one it documents.
     DiscriminatorNotFound(String),
     /// The IDL itself could not be resolved (missing, malformed, etc.).
     IdlResolutionError(String),
@@ -936,6 +936,102 @@ fn builtin_idl_records() -> &'static BTreeMap<String, solana_parser::solana::str
     })
 }
 
+/// Prefix of every Anchor `emit_cpi!` self-call: `sha256("anchor:event")[..8]` as a
+/// little-endian u64. `event discriminator ++ borsh(event)` follows it.
+const ANCHOR_EVENT_CPI_SENTINEL: [u8; 8] = [0xe4, 0x45, 0xa5, 0x2e, 0x51, 0xcb, 0x9a, 0x1d];
+
+/// `solana_parser::Idl` drops `events`, so they are re-read from the raw IDL JSON.
+/// TODO: add `events` to `solana_parser::Idl` upstream and drop this re-parse.
+#[derive(serde::Deserialize)]
+struct IdlEvent {
+    name: String,
+    /// Absent in legacy (pre-Anchor 0.30) IDLs, which derive it from the name.
+    #[serde(default)]
+    discriminator: Vec<u8>,
+    /// Inline in legacy IDLs; modern IDLs keep them in a same-named `types` struct.
+    #[serde(default)]
+    fields: Option<Vec<IdlField>>,
+}
+
+impl IdlEvent {
+    /// Anchor derives an omitted event discriminator as `sha256("event:<name>")[..8]`.
+    fn resolved_discriminator(&self) -> Vec<u8> {
+        if !self.discriminator.is_empty() {
+            return self.discriminator.clone();
+        }
+        let seed = format!("event:{}", self.name);
+        let hash = solana_sdk::hash::hash(seed.as_bytes()).to_bytes();
+        hash[..8].to_vec()
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct IdlEvents {
+    #[serde(default)]
+    events: Vec<IdlEvent>,
+}
+
+/// Decodes the `event discriminator ++ borsh(event)` payload that follows the sentinel.
+/// Matched by discriminator in `events`; fields are inline or in a same-named `types` struct.
+fn parse_anchor_event_cpi(
+    event_data: &[u8],
+    idl: &Idl,
+    idl_json: &str,
+    idl_source: &IdlSource,
+) -> Result<SolanaParsedInstructionDataIo, SolanaIdlParseError> {
+    let events: IdlEvents = serde_json::from_str(idl_json).map_err(|e| {
+        SolanaIdlParseError::IdlResolutionError(format!("IDL events are malformed: {e}"))
+    })?;
+    // Anchor 0.31+ permits custom-length event discriminators, so match by each one's length.
+    let event = events
+        .events
+        .into_iter()
+        .find(|event| event_data.starts_with(&event.resolved_discriminator()))
+        .ok_or_else(|| {
+            SolanaIdlParseError::DiscriminatorNotFound(format!(
+                "no matching event discriminator found for anchor event cpi data: {:?}",
+                hex::encode(event_data)
+            ))
+        })?;
+    let discriminator = event.resolved_discriminator();
+    let fields = match event.fields {
+        Some(fields) => fields,
+        None => idl
+            .types
+            .iter()
+            .find(|type_def| type_def.name == event.name)
+            .and_then(|type_def| match &type_def.r#type {
+                IdlTypeDefinitionType::Struct { fields } => Some(fields.clone()),
+                _ => None,
+            })
+            .ok_or_else(|| SolanaIdlParseError::DataParseError {
+                instruction_name: event.name.clone(),
+                error: "event has no struct type in IDL".to_string(),
+            })?,
+    };
+    // Shaped as an instruction to reuse the borsh args decoder; events have no accounts.
+    let instruction = IdlInstruction {
+        name: event.name,
+        discriminator: Some(discriminator.clone()),
+        accounts: Vec::new(),
+        args: fields,
+    };
+    let args = parse_data_into_args(event_data, &instruction, idl).map_err(|e| {
+        SolanaIdlParseError::DataParseError {
+            instruction_name: instruction.name.clone(),
+            error: e.to_string(),
+        }
+    })?;
+    Ok(SolanaParsedInstructionDataIo {
+        instruction_name: instruction.name,
+        discriminator: hex::encode(discriminator),
+        named_accounts: BTreeMap::new(),
+        program_call_args_json: canonical_args_json(&args),
+        idl_source: idl_source_string(idl_source),
+        idl_hash: compute_idl_hash(idl_json),
+    })
+}
+
 /// IDL-decodes one `PartiallyDecoded` instruction's raw data, using the exact same
 /// resolution chain the top-level static decoder's private `parse_idl` uses internally.
 /// The record is resolved by [`lookup_idl_record`], mirroring `parse_idl`'s
@@ -977,10 +1073,17 @@ fn parse_partially_decoded_instruction_idl(
     let instruction = match find_instruction_by_discriminator(&data, idl.instructions.clone()) {
         Ok(v) => v,
         Err(e) => {
-            return (
-                None,
-                Some(SolanaIdlParseError::DiscriminatorNotFound(e.to_string())),
-            );
+            // Anchor event CPIs match no `instructions` entry; decode against `events`.
+            let Some(event_data) = data.strip_prefix(ANCHOR_EVENT_CPI_SENTINEL.as_slice()) else {
+                return (
+                    None,
+                    Some(SolanaIdlParseError::DiscriminatorNotFound(e.to_string())),
+                );
+            };
+            return match parse_anchor_event_cpi(event_data, &idl, &idl_json, &idl_source) {
+                Ok(parsed) => (Some(parsed), None),
+                Err(err) => (None, Some(err)),
+            };
         }
     };
     let program_call_args = match parse_data_into_args(&data, &instruction, &idl) {
@@ -1184,7 +1287,7 @@ mod tests {
     use super::*;
     use base64::Engine;
     use serde_json::json;
-    use solana_parser::solana::structs::ProgramType;
+    use solana_parser::solana::structs::{IdlRecord, ProgramType};
     use solana_sdk::message::{MessageHeader, v0};
     use std::collections::HashMap;
 
@@ -1443,11 +1546,240 @@ mod tests {
             "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4"
         );
         assert_eq!(instructions[3].registered_source, RegisteredSource::Preset);
-        assert!(instructions[3].parsed_instruction_data.is_none());
         assert!(instructions[3].solana_json_parse_error.is_none());
+        assert!(instructions[3].idl_parse_error.is_none());
+        let event = instructions[3]
+            .parsed_instruction_data
+            .as_ref()
+            .expect("Anchor event CPI decodes against the preset IDL's events");
+        assert_eq!(event.instruction_name, "SwapsEvent");
+        assert_eq!(event.discriminator, "982f4eebc0606e6a");
+        assert!(event.named_accounts.is_empty());
+        assert_eq!(event.idl_source, "Preset");
+        let args: Value = serde_json::from_str(&event.program_call_args_json).unwrap();
+        assert_eq!(
+            args["swap_events"],
+            json!([{
+                "amm": "QuaNtZsgYRe5Z9Bk4LZ4cTD9tbkVoyCNf1R2BN9bBDv",
+                "input_amount": 13133749,
+                "input_mint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+                "output_amount": 136146331,
+                "output_mint": "So11111111111111111111111111111111111111112",
+            }])
+        );
+    }
+
+    const JUPITER_PROGRAM_ID: &str = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4";
+    const SWAPS_EVENT_DISCRIMINATOR: [u8; 8] = [0x98, 0x2f, 0x4e, 0xeb, 0xc0, 0x60, 0x6e, 0x6a];
+
+    fn decode_jupiter_inner_instruction(
+        data: &[u8],
+    ) -> (
+        Option<SolanaParsedInstructionDataIo>,
+        Option<SolanaIdlParseError>,
+    ) {
+        parse_partially_decoded_instruction_idl(
+            JUPITER_PROGRAM_ID,
+            &bs58::encode(data).into_string(),
+            &[],
+            &BTreeMap::new(),
+        )
+    }
+
+    #[test]
+    fn anchor_event_cpi_decodes_every_swap_leg() {
+        let legs: Vec<[Pubkey; 3]> = (0..3)
+            .map(|_| {
+                [
+                    Pubkey::new_unique(),
+                    Pubkey::new_unique(),
+                    Pubkey::new_unique(),
+                ]
+            })
+            .collect();
+        let mut data = ANCHOR_EVENT_CPI_SENTINEL.to_vec();
+        data.extend_from_slice(&SWAPS_EVENT_DISCRIMINATOR);
+        data.extend_from_slice(&(legs.len() as u32).to_le_bytes());
+        for (i, [input_mint, output_mint, amm]) in legs.iter().enumerate() {
+            data.extend_from_slice(input_mint.as_ref());
+            data.extend_from_slice(&(100 + i as u64).to_le_bytes());
+            data.extend_from_slice(output_mint.as_ref());
+            data.extend_from_slice(&(200 + i as u64).to_le_bytes());
+            data.extend_from_slice(amm.as_ref());
+        }
+
+        let (parsed, error) = decode_jupiter_inner_instruction(&data);
+
+        assert_eq!(error, None);
+        let parsed = parsed.expect("event decodes");
+        assert_eq!(parsed.instruction_name, "SwapsEvent");
+        assert_eq!(parsed.discriminator, hex::encode(SWAPS_EVENT_DISCRIMINATOR));
+        assert!(parsed.named_accounts.is_empty());
+        let args: Value = serde_json::from_str(&parsed.program_call_args_json).unwrap();
+        let expected: Vec<Value> = legs
+            .iter()
+            .enumerate()
+            .map(|(i, [input_mint, output_mint, amm])| {
+                json!({
+                    "amm": amm.to_string(),
+                    "input_amount": 100 + i,
+                    "input_mint": input_mint.to_string(),
+                    "output_amount": 200 + i,
+                    "output_mint": output_mint.to_string(),
+                })
+            })
+            .collect();
+        assert_eq!(args["swap_events"], Value::Array(expected));
+    }
+
+    const KAMINO_VAULT_PROGRAM_ID: &str = "KvauGMspG5k6rtzrqqn7WNn3oZdyKqLKwK2XWQ8FLjd";
+    /// `sha256("event:DepositResultEvent")[..8]`, pinned so the derivation formula is tested.
+    const DEPOSIT_RESULT_EVENT_DISCRIMINATOR: [u8; 8] =
+        [0x7b, 0x40, 0xdc, 0x04, 0x58, 0x67, 0x7f, 0xcc];
+
+    #[test]
+    fn anchor_event_cpi_decodes_legacy_idl_event_with_derived_discriminator() {
+        // Kamino Vault ships a legacy IDL: no event discriminators, inline fields,
+        // and no same-named `types` entry.
+        let mut data = ANCHOR_EVENT_CPI_SENTINEL.to_vec();
+        data.extend_from_slice(&DEPOSIT_RESULT_EVENT_DISCRIMINATOR);
+        data.extend_from_slice(&11u64.to_le_bytes());
+        data.extend_from_slice(&22u64.to_le_bytes());
+        data.extend_from_slice(&33u64.to_le_bytes());
+
+        let (parsed, error) = parse_partially_decoded_instruction_idl(
+            KAMINO_VAULT_PROGRAM_ID,
+            &bs58::encode(&data).into_string(),
+            &[],
+            &BTreeMap::new(),
+        );
+
+        assert_eq!(error, None);
+        let parsed = parsed.expect("legacy event decodes");
+        assert_eq!(parsed.instruction_name, "DepositResultEvent");
+        assert_eq!(
+            parsed.discriminator,
+            hex::encode(DEPOSIT_RESULT_EVENT_DISCRIMINATOR)
+        );
+        assert!(parsed.named_accounts.is_empty());
+        assert_eq!(parsed.idl_source, "Preset");
+        let args: Value = serde_json::from_str(&parsed.program_call_args_json).unwrap();
+        assert_eq!(
+            args,
+            json!({"crankFundsToDeposit": 33, "sharesToMint": 11, "tokenToDeposit": 22})
+        );
+    }
+
+    #[test]
+    fn anchor_event_cpi_with_unknown_event_reports_discriminator_not_found() {
+        let mut data = ANCHOR_EVENT_CPI_SENTINEL.to_vec();
+        data.extend_from_slice(&[0xff; 8]);
+
+        let (parsed, error) = decode_jupiter_inner_instruction(&data);
+
+        assert!(parsed.is_none());
         assert!(matches!(
-            instructions[3].idl_parse_error,
-            Some(SolanaIdlParseError::DiscriminatorNotFound(_))
+            error,
+            Some(SolanaIdlParseError::DiscriminatorNotFound(msg))
+                if msg.contains("no matching event discriminator")
+        ));
+    }
+
+    #[test]
+    fn anchor_event_cpi_with_undecodable_payload_reports_data_parse_error() {
+        let mut data = ANCHOR_EVENT_CPI_SENTINEL.to_vec();
+        data.extend_from_slice(&SWAPS_EVENT_DISCRIMINATOR);
+        // One leg announced, none present.
+        data.extend_from_slice(&1u32.to_le_bytes());
+
+        let (parsed, error) = decode_jupiter_inner_instruction(&data);
+
+        assert!(parsed.is_none());
+        assert!(matches!(
+            error,
+            Some(SolanaIdlParseError::DataParseError { instruction_name, .. })
+                if instruction_name == "SwapsEvent"
+        ));
+    }
+
+    fn caller_records_for(program_id: &str, idl_json: &str) -> BTreeMap<String, IdlRecord> {
+        let record = IdlRecord {
+            program_id: program_id.to_string(),
+            program_name: "caller".to_string(),
+            program_type: None,
+            custom_idl: Some(serde_json::from_str(idl_json).unwrap()),
+            custom_idl_json: Some(idl_json.to_string()),
+            override_builtin: true,
+            is_preset: false,
+        };
+        BTreeMap::from([(program_id.to_string(), record)])
+    }
+
+    #[test]
+    fn anchor_event_cpi_with_malformed_idl_events_reports_idl_resolution_error() {
+        let program_id = Pubkey::new_unique().to_string();
+        // `Idl` ignores `events`, so resolution succeeds and only the event path sees it.
+        let idl_json = r#"{"instructions":[],"types":[],"events":"not-a-list"}"#;
+        let caller_records = caller_records_for(&program_id, idl_json);
+        let mut data = ANCHOR_EVENT_CPI_SENTINEL.to_vec();
+        data.extend_from_slice(&SWAPS_EVENT_DISCRIMINATOR);
+
+        let (parsed, error) = parse_partially_decoded_instruction_idl(
+            &program_id,
+            &bs58::encode(&data).into_string(),
+            &[],
+            &caller_records,
+        );
+
+        assert!(parsed.is_none());
+        assert!(matches!(
+            error,
+            Some(SolanaIdlParseError::IdlResolutionError(msg))
+                if msg.contains("IDL events are malformed")
+        ));
+    }
+
+    #[test]
+    fn anchor_event_cpi_matches_custom_length_event_discriminator() {
+        let program_id = Pubkey::new_unique().to_string();
+        // Anchor 0.31 `#[event(discriminator = ...)]` allows any length; this one is 4 bytes.
+        let idl_json = r#"{
+            "instructions": [],
+            "types": [{
+                "name": "Ping",
+                "type": {"kind": "struct", "fields": [{"name": "nonce", "type": "u64"}]}
+            }],
+            "events": [{"name": "Ping", "discriminator": [1, 2, 3, 4]}]
+        }"#;
+        let caller_records = caller_records_for(&program_id, idl_json);
+        let mut data = ANCHOR_EVENT_CPI_SENTINEL.to_vec();
+        data.extend_from_slice(&[1, 2, 3, 4]);
+        data.extend_from_slice(&7u64.to_le_bytes());
+
+        let (parsed, error) = parse_partially_decoded_instruction_idl(
+            &program_id,
+            &bs58::encode(&data).into_string(),
+            &[],
+            &caller_records,
+        );
+
+        assert_eq!(error, None);
+        let parsed = parsed.expect("custom-length event discriminator matches");
+        assert_eq!(parsed.instruction_name, "Ping");
+        assert_eq!(parsed.discriminator, "01020304");
+        let args: Value = serde_json::from_str(&parsed.program_call_args_json).unwrap();
+        assert_eq!(args, json!({"nonce": 7}));
+    }
+
+    #[test]
+    fn non_event_unknown_discriminator_still_reports_discriminator_not_found() {
+        let (parsed, error) = decode_jupiter_inner_instruction(&[0xff; 16]);
+
+        assert!(parsed.is_none());
+        assert!(matches!(
+            error,
+            Some(SolanaIdlParseError::DiscriminatorNotFound(msg))
+                if msg.contains("no matching instruction discriminator")
         ));
     }
 
