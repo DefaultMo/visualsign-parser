@@ -982,14 +982,11 @@ fn parse_anchor_event_cpi(
     let events: IdlEvents = serde_json::from_str(idl_json).map_err(|e| {
         SolanaIdlParseError::IdlResolutionError(format!("IDL events are malformed: {e}"))
     })?;
-    let event = event_data
-        .get(..8)
-        .and_then(|discriminator| {
-            events
-                .events
-                .into_iter()
-                .find(|event| event.resolved_discriminator() == discriminator)
-        })
+    // Anchor 0.31+ permits custom-length event discriminators, so match by each one's length.
+    let event = events
+        .events
+        .into_iter()
+        .find(|event| event_data.starts_with(&event.resolved_discriminator()))
         .ok_or_else(|| {
             SolanaIdlParseError::DiscriminatorNotFound(format!(
                 "no matching event discriminator found for anchor event cpi data: {:?}",
@@ -1705,21 +1702,25 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn anchor_event_cpi_with_malformed_idl_events_reports_idl_resolution_error() {
-        let program_id = Pubkey::new_unique().to_string();
-        // `Idl` ignores `events`, so resolution succeeds and only the event path sees it.
-        let idl_json = r#"{"instructions":[],"types":[],"events":"not-a-list"}"#;
+    fn caller_records_for(program_id: &str, idl_json: &str) -> BTreeMap<String, IdlRecord> {
         let record = IdlRecord {
-            program_id: program_id.clone(),
-            program_name: "malformed".to_string(),
+            program_id: program_id.to_string(),
+            program_name: "caller".to_string(),
             program_type: None,
             custom_idl: Some(serde_json::from_str(idl_json).unwrap()),
             custom_idl_json: Some(idl_json.to_string()),
             override_builtin: true,
             is_preset: false,
         };
-        let caller_records = BTreeMap::from([(program_id.clone(), record)]);
+        BTreeMap::from([(program_id.to_string(), record)])
+    }
+
+    #[test]
+    fn anchor_event_cpi_with_malformed_idl_events_reports_idl_resolution_error() {
+        let program_id = Pubkey::new_unique().to_string();
+        // `Idl` ignores `events`, so resolution succeeds and only the event path sees it.
+        let idl_json = r#"{"instructions":[],"types":[],"events":"not-a-list"}"#;
+        let caller_records = caller_records_for(&program_id, idl_json);
         let mut data = ANCHOR_EVENT_CPI_SENTINEL.to_vec();
         data.extend_from_slice(&SWAPS_EVENT_DISCRIMINATOR);
 
@@ -1736,6 +1737,38 @@ mod tests {
             Some(SolanaIdlParseError::IdlResolutionError(msg))
                 if msg.contains("IDL events are malformed")
         ));
+    }
+
+    #[test]
+    fn anchor_event_cpi_matches_custom_length_event_discriminator() {
+        let program_id = Pubkey::new_unique().to_string();
+        // Anchor 0.31 `#[event(discriminator = ...)]` allows any length; this one is 4 bytes.
+        let idl_json = r#"{
+            "instructions": [],
+            "types": [{
+                "name": "Ping",
+                "type": {"kind": "struct", "fields": [{"name": "nonce", "type": "u64"}]}
+            }],
+            "events": [{"name": "Ping", "discriminator": [1, 2, 3, 4]}]
+        }"#;
+        let caller_records = caller_records_for(&program_id, idl_json);
+        let mut data = ANCHOR_EVENT_CPI_SENTINEL.to_vec();
+        data.extend_from_slice(&[1, 2, 3, 4]);
+        data.extend_from_slice(&7u64.to_le_bytes());
+
+        let (parsed, error) = parse_partially_decoded_instruction_idl(
+            &program_id,
+            &bs58::encode(&data).into_string(),
+            &[],
+            &caller_records,
+        );
+
+        assert_eq!(error, None);
+        let parsed = parsed.expect("custom-length event discriminator matches");
+        assert_eq!(parsed.instruction_name, "Ping");
+        assert_eq!(parsed.discriminator, "01020304");
+        let args: Value = serde_json::from_str(&parsed.program_call_args_json).unwrap();
+        assert_eq!(args, json!({"nonce": 7}));
     }
 
     #[test]
