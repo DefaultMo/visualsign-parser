@@ -33,7 +33,7 @@ use solana_parser::solana::idl_parser::{
     find_instruction_by_discriminator, parse_data_into_args, resolve_idl_for_record,
 };
 use solana_parser::solana::structs::{
-    self as parser, AccountAddress, Idl, IdlInstruction, IdlParseError, IdlSource,
+    self as parser, AccountAddress, Idl, IdlField, IdlInstruction, IdlParseError, IdlSource,
     IdlTypeDefinitionType, SolanaMetadata, SolanaParsedInstructionData,
 };
 use solana_parser::{CustomIdlConfig, parse_transaction_with_idl_records};
@@ -945,8 +945,24 @@ const ANCHOR_EVENT_CPI_SENTINEL: [u8; 8] = [0xe4, 0x45, 0xa5, 0x2e, 0x51, 0xcb, 
 #[derive(serde::Deserialize)]
 struct IdlEvent {
     name: String,
+    /// Absent in legacy (pre-Anchor 0.30) IDLs, which derive it from the name.
     #[serde(default)]
     discriminator: Vec<u8>,
+    /// Inline in legacy IDLs; modern IDLs keep them in a same-named `types` struct.
+    #[serde(default)]
+    fields: Option<Vec<IdlField>>,
+}
+
+impl IdlEvent {
+    /// Anchor derives an omitted event discriminator as `sha256("event:<name>")[..8]`.
+    fn resolved_discriminator(&self) -> Vec<u8> {
+        if !self.discriminator.is_empty() {
+            return self.discriminator.clone();
+        }
+        let seed = format!("event:{}", self.name);
+        let hash = solana_sdk::hash::hash(seed.as_bytes()).to_bytes();
+        hash[..8].to_vec()
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -956,7 +972,7 @@ struct IdlEvents {
 }
 
 /// Decodes the `event discriminator ++ borsh(event)` payload that follows the sentinel.
-/// Matched by discriminator in `events`; fields come from the same-named `types` struct.
+/// Matched by discriminator in `events`; fields are inline or in a same-named `types` struct.
 fn parse_anchor_event_cpi(
     event_data: &[u8],
     idl: &Idl,
@@ -972,7 +988,7 @@ fn parse_anchor_event_cpi(
             events
                 .events
                 .into_iter()
-                .find(|event| event.discriminator == discriminator)
+                .find(|event| event.resolved_discriminator() == discriminator)
         })
         .ok_or_else(|| {
             SolanaIdlParseError::DiscriminatorNotFound(format!(
@@ -980,22 +996,26 @@ fn parse_anchor_event_cpi(
                 hex::encode(event_data)
             ))
         })?;
-    let fields = idl
-        .types
-        .iter()
-        .find(|type_def| type_def.name == event.name)
-        .and_then(|type_def| match &type_def.r#type {
-            IdlTypeDefinitionType::Struct { fields } => Some(fields.clone()),
-            _ => None,
-        })
-        .ok_or_else(|| SolanaIdlParseError::DataParseError {
-            instruction_name: event.name.clone(),
-            error: "event has no struct type in IDL".to_string(),
-        })?;
+    let discriminator = event.resolved_discriminator();
+    let fields = match event.fields {
+        Some(fields) => fields,
+        None => idl
+            .types
+            .iter()
+            .find(|type_def| type_def.name == event.name)
+            .and_then(|type_def| match &type_def.r#type {
+                IdlTypeDefinitionType::Struct { fields } => Some(fields.clone()),
+                _ => None,
+            })
+            .ok_or_else(|| SolanaIdlParseError::DataParseError {
+                instruction_name: event.name.clone(),
+                error: "event has no struct type in IDL".to_string(),
+            })?,
+    };
     // Shaped as an instruction to reuse the borsh args decoder; events have no accounts.
     let instruction = IdlInstruction {
         name: event.name,
-        discriminator: Some(event.discriminator.clone()),
+        discriminator: Some(discriminator.clone()),
         accounts: Vec::new(),
         args: fields,
     };
@@ -1007,7 +1027,7 @@ fn parse_anchor_event_cpi(
     })?;
     Ok(SolanaParsedInstructionDataIo {
         instruction_name: instruction.name,
-        discriminator: hex::encode(event.discriminator),
+        discriminator: hex::encode(discriminator),
         named_accounts: BTreeMap::new(),
         program_call_args_json: canonical_args_json(&args),
         idl_source: idl_source_string(idl_source),
@@ -1613,6 +1633,44 @@ mod tests {
             })
             .collect();
         assert_eq!(args["swap_events"], Value::Array(expected));
+    }
+
+    const KAMINO_VAULT_PROGRAM_ID: &str = "KvauGMspG5k6rtzrqqn7WNn3oZdyKqLKwK2XWQ8FLjd";
+    /// `sha256("event:DepositResultEvent")[..8]`, pinned so the derivation formula is tested.
+    const DEPOSIT_RESULT_EVENT_DISCRIMINATOR: [u8; 8] =
+        [0x7b, 0x40, 0xdc, 0x04, 0x58, 0x67, 0x7f, 0xcc];
+
+    #[test]
+    fn anchor_event_cpi_decodes_legacy_idl_event_with_derived_discriminator() {
+        // Kamino Vault ships a legacy IDL: no event discriminators, inline fields,
+        // and no same-named `types` entry.
+        let mut data = ANCHOR_EVENT_CPI_SENTINEL.to_vec();
+        data.extend_from_slice(&DEPOSIT_RESULT_EVENT_DISCRIMINATOR);
+        data.extend_from_slice(&11u64.to_le_bytes());
+        data.extend_from_slice(&22u64.to_le_bytes());
+        data.extend_from_slice(&33u64.to_le_bytes());
+
+        let (parsed, error) = parse_partially_decoded_instruction_idl(
+            KAMINO_VAULT_PROGRAM_ID,
+            &bs58::encode(&data).into_string(),
+            &[],
+            &BTreeMap::new(),
+        );
+
+        assert_eq!(error, None);
+        let parsed = parsed.expect("legacy event decodes");
+        assert_eq!(parsed.instruction_name, "DepositResultEvent");
+        assert_eq!(
+            parsed.discriminator,
+            hex::encode(DEPOSIT_RESULT_EVENT_DISCRIMINATOR)
+        );
+        assert!(parsed.named_accounts.is_empty());
+        assert_eq!(parsed.idl_source, "Preset");
+        let args: Value = serde_json::from_str(&parsed.program_call_args_json).unwrap();
+        assert_eq!(
+            args,
+            json!({"crankFundsToDeposit": 33, "sharesToMint": 11, "tokenToDeposit": 22})
+        );
     }
 
     #[test]
