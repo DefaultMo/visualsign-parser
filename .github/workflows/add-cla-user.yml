@@ -28,7 +28,7 @@ concurrency:
 jobs:
   add-user-to-cla-list:
     if: github.event.issue.pull_request
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - name: Parse command
         id: command_check
